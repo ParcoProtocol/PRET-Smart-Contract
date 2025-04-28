@@ -1,31 +1,36 @@
-// Smart Contract for Parco's Showcase Property Token (Polygon)
-// Version 1 - Supports: Ownership, Distributions, Stay Utility, Governance
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract ParcoPropertyToken is ERC20, Ownable, ReentrancyGuard {
-    // Showcase Property Info (set during deployment)
+    using SafeERC20 for IERC20;
+
+    // Property details
     string public propertyName;
     uint256 public propertyValue;
-    uint256 public annualDistributionRate; // e.g., 9 means 9% annual return
-    address public payoutWallet; // wallet where revenue is deposited for distribution
+    uint256 public annualDistributionRate; // percentage (e.g., 9 for 9%)
+    address public payoutWallet;
+    IERC20 public stablecoin; // USDC recommended
 
-    // Stay Utility
-    mapping(address => bool) public stayLocked; // If true, user forfeits yield for stay access
+    // Whitelist compliance
+    mapping(address => bool) public whitelist;
+
+    // Stay utility
+    mapping(address => bool) public stayLocked;
     mapping(address => uint256) public stayLockTimestamp;
-    uint256 public stayLockPeriod = 365 days;
+    uint256 public constant stayLockPeriod = 365 days;
 
-    // Distribution
+    // Distribution management
     mapping(address => uint256) public lastClaimed;
-    uint256 public distributionInterval = 30 days;
+    uint256 public constant distributionInterval = 30 days;
 
     event DistributionClaimed(address indexed user, uint256 amount);
     event StayLocked(address indexed user, uint256 timestamp);
+    event WhitelistUpdated(address indexed user, bool status);
 
     constructor(
         string memory _name,
@@ -34,58 +39,82 @@ contract ParcoPropertyToken is ERC20, Ownable, ReentrancyGuard {
         uint256 _propertyValue,
         uint256 _annualDistributionRate,
         uint256 _totalSupply,
-        address _payoutWallet
+        address _payoutWallet,
+        address _stablecoinAddress
     ) ERC20(_name, _symbol) {
         propertyName = _propertyName;
         propertyValue = _propertyValue;
         annualDistributionRate = _annualDistributionRate;
         payoutWallet = _payoutWallet;
+        stablecoin = IERC20(_stablecoinAddress);
 
         _mint(msg.sender, _totalSupply * (10 ** decimals()));
     }
 
-    function lockForStay() external {
-        require(balanceOf(msg.sender) > 0, "You must hold tokens");
+    modifier onlyWhitelisted(address _user) {
+        require(whitelist[_user], "Address not whitelisted");
+        _;
+    }
+
+    function updateWhitelist(address _user, bool _status) external onlyOwner {
+        whitelist[_user] = _status;
+        emit WhitelistUpdated(_user, _status);
+    }
+
+    function lockForStay() external onlyWhitelisted(msg.sender) {
+        require(balanceOf(msg.sender) > 0, "Must hold tokens");
         stayLocked[msg.sender] = true;
         stayLockTimestamp[msg.sender] = block.timestamp;
         emit StayLocked(msg.sender, block.timestamp);
     }
 
-    function claimDistribution() external nonReentrant {
-        require(!stayLocked[msg.sender] || block.timestamp > stayLockTimestamp[msg.sender] + stayLockPeriod,
-            "Your tokens are locked for stay and ineligible for yield");
+    function claimDistribution() external nonReentrant onlyWhitelisted(msg.sender) {
+        require(
+            !stayLocked[msg.sender] || block.timestamp > stayLockTimestamp[msg.sender] + stayLockPeriod,
+            "Tokens locked for stay"
+        );
 
-        uint256 timeElapsed = block.timestamp - lastClaimed[msg.sender];
-        require(timeElapsed >= distributionInterval, "Already claimed this period");
+        uint256 lastClaim = lastClaimed[msg.sender];
+        if (lastClaim == 0) {
+            lastClaim = block.timestamp - distributionInterval;
+        }
+
+        require(block.timestamp >= lastClaim + distributionInterval, "Already claimed this period");
 
         uint256 userShare = balanceOf(msg.sender);
-        uint256 totalSupply_ = totalSupply();
-        uint256 distributionAmount = (propertyValue * annualDistributionRate / 100) * userShare / totalSupply_ / (365 / 30); // monthly share
+        uint256 monthlyDistribution = (propertyValue * annualDistributionRate * distributionInterval * userShare) /
+            (100 * totalSupply() * 365 days);
 
         lastClaimed[msg.sender] = block.timestamp;
 
-        // payout simulated as a transfer from the payout wallet
-        payable(msg.sender).transfer(distributionAmount);
+        stablecoin.safeTransferFrom(payoutWallet, msg.sender, monthlyDistribution);
 
-        emit DistributionClaimed(msg.sender, distributionAmount);
+        emit DistributionClaimed(msg.sender, monthlyDistribution);
     }
 
-    // Allow owner to withdraw accidentally sent ETH
-    function withdraw() external onlyOwner {
+    // Override ERC20 transfer to include whitelist checks
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override onlyWhitelisted(to) {
+        if (from != address(0)) {
+            require(whitelist[from], "Sender not whitelisted");
+        }
+        super._beforeTokenTransfer(from, to, amount);
+    }
+
+    // Owner can withdraw accidentally sent tokens
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyOwner {
+        IERC20(tokenAddress).safeTransfer(owner(), tokenAmount);
+    }
+
+    // Accept ETH sent directly to contract (for any future flexibility)
+    receive() external payable {}
+
+    function withdrawETH() external onlyOwner {
         payable(owner()).transfer(address(this).balance);
     }
-
-    // Accept ETH sent to contract (e.g. from revenue streams)
-    receive() external payable {}
 }
 
-// DEPLOYMENT INSTRUCTIONS:
-// Fill in the constructor with:
-// name: "Parco Showcase Token"
-// symbol: "PST1"
-// propertyName: "Showcase Property 001"
-// propertyValue: e.g., 500000 ether (in USD-equivalent via stablecoin or ETH on Polygon)
-// annualDistributionRate: 9 (for 9%)
-// totalSupply: 10000 tokens (1 token = 1/10000 share)
-// payoutWallet: Parco's multisig or vault receiving rental revenue
 
